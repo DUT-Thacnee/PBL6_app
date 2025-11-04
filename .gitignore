@@ -46,3 +46,18 @@ app.*.map.json
 # Local dart defines (API keys, etc.)
 dart-defines.local.json
 dart-defines.json
+
+# Ignore project-local metadata and helpers
+.metadata
+JAVA_SETUP_GUIDE.md
+temp_code.json
+pubspec.lock
+
+# If you only want to publish source code in lib/ to GitHub,
+# comment IN the following block. It ignores everything at repo root
+# except lib/, README.md and this .gitignore. Place at end so it wins.
+#
+# /*
+# !/lib/
+# !README.md
+# !.gitignore
