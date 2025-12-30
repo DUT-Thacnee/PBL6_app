@@ -9,17 +9,8 @@ class AiResult {
   AiResult({required this.analysis, required this.recommendations});
 }
 
-/// Simple OpenAI-compatible client to call DeepSeek or a router provider.
-///
-/// Configure with --dart-define to avoid hardcoding secrets:
-///   --dart-define=DEEPSEEK_API_KEY=sk-... \
-///   --dart-define=DEEPSEEK_BASE_URL=https://api.deepseek.com \
-///   --dart-define=DEEPSEEK_MODEL=deepseek-chat
-/// Or to use Hugging Face router/Novita:
-///   --dart-define=DEEPSEEK_BASE_URL=https://router.huggingface.co/v1 \
-///   --dart-define=DEEPSEEK_MODEL=deepseek-ai/DeepSeek-V3.1:novita
 class AIService {
-  static const _apiKey = String.fromEnvironment('DEEPSEEK_API_KEY');
+  static const _apiKeyEnv = String.fromEnvironment('DEEPSEEK_API_KEY');
   // Do NOT set defaults here; allow runtime (SharedPreferences) to override when env is absent.
   static const _baseUrlEnv = String.fromEnvironment('DEEPSEEK_BASE_URL');
   static const _modelEnv = String.fromEnvironment('DEEPSEEK_MODEL');
@@ -45,8 +36,9 @@ class AIService {
   static Future<({String apiKey, String baseUrl, String model})>
       _resolveConfig() async {
     final prefs = await SharedPreferences.getInstance();
-    final apiKey =
-        _apiKey.isNotEmpty ? _apiKey : (prefs.getString(_kPrefApiKey) ?? '');
+    final apiKey = _apiKeyEnv.isNotEmpty
+        ? _apiKeyEnv
+        : (prefs.getString(_kPrefApiKey) ?? '');
     final baseUrl = _baseUrlEnv.isNotEmpty
         ? _baseUrlEnv
         : (prefs.getString(_kPrefBaseUrl) ?? 'https://api.deepseek.com');

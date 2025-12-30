@@ -47,11 +47,13 @@ app.*.map.json
 dart-defines.local.json
 dart-defines.json
 
+# Local signing config (keep untracked)
+android/key.properties.local
+
 # Ignore project-local metadata and helpers
 .metadata
 JAVA_SETUP_GUIDE.md
 temp_code.json
-pubspec.lock
 
 # If you only want to publish source code in lib/ to GitHub,
 # comment IN the following block. It ignores everything at repo root

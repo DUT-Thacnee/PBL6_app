@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:pbl6_app/services/ai_service.dart';
+import 'package:pbl6_smart_ac/services/ai_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// Analysis window for AI insights
@@ -114,7 +114,7 @@ class _ReportScreenState extends State<ReportScreen> {
                     ),
                     const SizedBox(width: 8),
                     const Text(
-                      '30-Day Air Quality Heatmap',
+                      'Monthly Hourly IAQ Heatmap',
                       style: TextStyle(
                         fontSize: 18,
                         fontWeight: FontWeight.bold,
@@ -163,7 +163,7 @@ class _ReportScreenState extends State<ReportScreen> {
     if (_heatmapRows.isEmpty) {
       return Center(
         child: Text(
-          'No IAQ data in the last 30 days',
+          'No IAQ data recorded this month',
           style: TextStyle(color: Colors.grey[600]),
         ),
       );
@@ -202,12 +202,13 @@ class _ReportScreenState extends State<ReportScreen> {
                       children: List.generate(columns, (i) {
                         return SizedBox(
                           width: cellW + cellGap,
-                          child: (i % 10 == 0)
-                              ? Center(
-                                  child: Text('${i + 1}',
-                                      style: const TextStyle(
-                                          fontSize: 8, color: Colors.grey)))
-                              : const SizedBox.shrink(),
+                          child: Center(
+                            child: Text(
+                              '${i.toString().padLeft(2, '0')}h',
+                              style: const TextStyle(
+                                  fontSize: 8, color: Colors.grey),
+                            ),
+                          ),
                         );
                       }),
                     ),
@@ -257,28 +258,26 @@ class _ReportScreenState extends State<ReportScreen> {
                             final label =
                                 '${_two(row.day.month)}/${_two(row.day.day)}';
                             return Row(
-                              children: [
-                                ...row.values.map((v) => GestureDetector(
-                                      onTap: () =>
-                                          _showIAQDetails(context, label, v),
-                                      child: Container(
-                                        width: cellW,
-                                        height: cellH,
-                                        margin:
-                                            const EdgeInsets.all(cellGap / 2),
-                                        decoration: BoxDecoration(
-                                          color: _aqiColor(v),
-                                          borderRadius:
-                                              BorderRadius.circular(2),
-                                        ),
-                                      ),
-                                    )),
-                                if (row.values.length < columns)
-                                  SizedBox(
-                                    width: (columns - row.values.length) *
-                                        (cellW + cellGap),
+                              children: List.generate(columns, (i) {
+                                final v = i < row.values.length
+                                    ? row.values[i]
+                                    : null;
+                                final hasValue = v != null;
+                                return GestureDetector(
+                                  onTap: hasValue
+                                      ? () => _showIAQDetails(context, label, v)
+                                      : null,
+                                  child: Container(
+                                    width: cellW,
+                                    height: cellH,
+                                    margin: const EdgeInsets.all(cellGap / 2),
+                                    decoration: BoxDecoration(
+                                      color: _aqiColorNullable(v),
+                                      borderRadius: BorderRadius.circular(2),
+                                    ),
                                   ),
-                              ],
+                                );
+                              }),
                             );
                           }).toList(),
                         ),
@@ -295,7 +294,8 @@ class _ReportScreenState extends State<ReportScreen> {
   }
 
   // Show IAQ details in modal for mobile
-  void _showIAQDetails(BuildContext context, String dateLabel, double iaq) {
+  void _showIAQDetails(BuildContext context, String dateLabel, double? iaq) {
+    if (iaq == null) return;
     showDialog(
       context: context,
       builder: (BuildContext context) {
@@ -465,11 +465,25 @@ class _ReportScreenState extends State<ReportScreen> {
 
   Future<void> _openAISettingsDialog() async {
     final prefs = await SharedPreferences.getInstance();
-    final apiKey = prefs.getString('deepseek_api_key') ?? '';
-    final baseUrl = prefs.getString('deepseek_base_url') ??
-        'https://router.huggingface.co/v1';
-    final model =
-        prefs.getString('deepseek_model') ?? 'deepseek-ai/DeepSeek-V3.1:novita';
+    final envApiKey = const String.fromEnvironment('DEEPSEEK_API_KEY');
+    final envBaseUrl = const String.fromEnvironment('DEEPSEEK_BASE_URL');
+    final envModel = const String.fromEnvironment('DEEPSEEK_MODEL');
+
+    final apiKey = _firstNonEmpty(
+      prefs.getString('deepseek_api_key'),
+      envApiKey,
+      '',
+    );
+    final baseUrl = _firstNonEmpty(
+      prefs.getString('deepseek_base_url'),
+      envBaseUrl,
+      'https://api.deepseek.com',
+    );
+    final model = _firstNonEmpty(
+      prefs.getString('deepseek_model'),
+      envModel,
+      'deepseek-chat',
+    );
 
     final apiKeyCtrl = TextEditingController(text: apiKey);
     final baseUrlCtrl = TextEditingController(text: baseUrl);
@@ -534,6 +548,12 @@ class _ReportScreenState extends State<ReportScreen> {
         );
       },
     );
+  }
+
+  String _firstNonEmpty(String? stored, String env, String fallback) {
+    if (stored != null && stored.isNotEmpty) return stored;
+    if (env.isNotEmpty) return env;
+    return fallback;
   }
 
   Widget _buildAnalysisContent() {
@@ -657,18 +677,20 @@ class _ReportScreenState extends State<ReportScreen> {
     return const Color(0xFF7F1D1D); // Hazardous - maroon
   }
 
+  Color _aqiColorNullable(double? aqi) {
+    if (aqi == null) {
+      return Colors.grey.shade200;
+    }
+    return _aqiColor(aqi);
+  }
+
   Future<void> _loadHeatmapData() async {
     if (_loadingHeatmap) return;
     setState(() => _loadingHeatmap = true);
     try {
       final now = DateTime.now();
-      // Load PREVIOUS month (ví dụ hiện tại là 11 -> lấy 10)
-      int targetYear = now.year;
-      int targetMonth = now.month - 1;
-      if (targetMonth == 0) {
-        targetMonth = 12;
-        targetYear -= 1;
-      }
+      final targetYear = now.year;
+      final targetMonth = now.month;
       final monthStart = DateTime(targetYear, targetMonth, 1);
       final nextMonth = DateTime(targetYear, targetMonth + 1, 1);
       final snap = await FirebaseFirestore.instance
@@ -677,23 +699,25 @@ class _ReportScreenState extends State<ReportScreen> {
           .limit(5000)
           .get();
 
-      final Map<DateTime, List<double>> grouped = {};
+      final Map<DateTime, List<double?>> grouped = {};
       for (final doc in snap.docs) {
         final data = doc.data();
         final dt = _parseDateTime(data['datetime']);
         if (dt == null) continue;
-        if (dt.isBefore(monthStart))
-          break; // stop when older than current month
-        if (dt.isAfter(nextMonth.subtract(const Duration(milliseconds: 1)))) {
-          // newer than current month (future/next month) → skip
-          continue;
-        }
+        if (dt.isBefore(monthStart)) break;
+        if (!dt.isBefore(nextMonth)) continue;
         final iaqVal =
             data['iaq'] ?? data['IAQ'] ?? data['iaq_score'] ?? data['iaqIndex'];
         final d = _toDouble(iaqVal);
         if (d == null) continue;
         final dayKey = DateTime(dt.year, dt.month, dt.day);
-        (grouped[dayKey] ??= []).add(d);
+        final buckets =
+            grouped.putIfAbsent(dayKey, () => List<double?>.filled(24, null));
+        final hour = dt.hour;
+        final existing = buckets[hour];
+        if (existing == null || d > existing) {
+          buckets[hour] = d;
+        }
       }
 
       final daysInMonth = DateTime(targetYear, targetMonth + 1, 0).day;
@@ -704,7 +728,8 @@ class _ReportScreenState extends State<ReportScreen> {
       final rows = <_DaySeries>[];
       int maxLen = 0;
       for (final d in days) {
-        final vals = grouped[d] ?? [];
+        final vals = (grouped[d] ?? List<double?>.filled(24, null))
+            .toList(growable: false);
         if (vals.length > maxLen) maxLen = vals.length;
         rows.add(_DaySeries(day: d, values: vals));
       }
@@ -917,7 +942,7 @@ class _ReportScreenState extends State<ReportScreen> {
 
 class _DaySeries {
   final DateTime day;
-  final List<double> values;
+  final List<double?> values;
   _DaySeries({required this.day, required this.values});
 }
 
@@ -959,9 +984,9 @@ class _FancySegmentedControl extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     const items = [
-      (AnalysisWindow.day, '1 ngày'),
-      (AnalysisWindow.week, '1 tuần'),
-      (AnalysisWindow.month, '1 tháng'),
+      (AnalysisWindow.day, '1 Day'),
+      (AnalysisWindow.week, '1 Week'),
+      (AnalysisWindow.month, '1 Month'),
     ];
     final primary = const Color(0xFF9C27B0);
     final radius = BorderRadius.circular(16);

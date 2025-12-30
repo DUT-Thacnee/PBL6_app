@@ -1,6 +1,13 @@
+import 'dart:async';
+
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../firebase_options.dart';
 import '../services/device_manager.dart';
-import 'firebase_test_screen.dart';
+import '../services/realtime_db_service.dart';
 
 class ControlScreen extends StatefulWidget {
   const ControlScreen({super.key});
@@ -12,54 +19,29 @@ class ControlScreen extends StatefulWidget {
 class _ControlScreenState extends State<ControlScreen> {
   late DeviceManagerService _deviceManager;
 
-  // Light and AC data structures
-  List<LightDevice> _lights = [
-    LightDevice(
-      id: '1',
-      name: 'Office Lights Zone 1',
-      isOn: true,
-      brightness: 70,
-      location: 'Main Office',
-      color: Colors.white,
-    ),
-    LightDevice(
-      id: '2',
-      name: 'Office Lights Zone 2',
-      isOn: true,
-      brightness: 70,
-      location: 'Meeting Room',
-      color: Colors.white,
-    ),
-    LightDevice(
-      id: '3',
-      name: 'Office Lights Zone 3',
-      isOn: false,
-      brightness: 0,
-      location: 'Break Room',
-      color: Colors.white,
-    ),
-  ];
+  static const String _automationPrefKey = 'control_automation_enabled';
 
-  List<AirConditionerDevice> _airConditioners = [
-    AirConditionerDevice(
-      id: '1',
-      name: 'Office AC Unit 1',
-      isOn: true,
-      temperature: 24,
-      mode: 'Auto',
-      location: 'Main Office',
-      fanSpeed: 'Medium',
-    ),
-    AirConditionerDevice(
-      id: '2',
-      name: 'Office AC Unit 2',
-      isOn: true,
-      temperature: 26,
-      mode: 'Eco',
-      location: 'Conference Room',
-      fanSpeed: 'Low',
-    ),
-  ];
+  // Simplified: single light toggle + latency
+  bool _lightOn = false;
+  int? _latencyMicros;
+  bool _sending = false;
+
+  // Automation state
+  bool _automationOn = false;
+  bool _automationBusy = false;
+  String? _automationMessage;
+  double? _currentTemp;
+  double? _currentIaq;
+  double? _currentAcSetpoint;
+  int? _currentAfLevel;
+  StreamSubscription<DatabaseEvent>? _automationSensorSub;
+  bool _firebaseReady = false;
+  DateTime? _tempHighSince;
+  DateTime? _tempLowSince;
+  bool _tempHighMildApplied = false;
+  bool _tempHighSevereApplied = false;
+  bool _tempLowMildApplied = false;
+  bool _tempLowSevereApplied = false;
 
   @override
   void initState() {
@@ -67,11 +49,13 @@ class _ControlScreenState extends State<ControlScreen> {
     _deviceManager = DeviceManagerService();
     _deviceManager.addListener(_updateUI);
     _syncWithDeviceManager();
+    _restoreAutomationPreference();
   }
 
   @override
   void dispose() {
     _deviceManager.removeListener(_updateUI);
+    _automationSensorSub?.cancel();
     super.dispose();
   }
 
@@ -80,51 +64,23 @@ class _ControlScreenState extends State<ControlScreen> {
   }
 
   void _syncWithDeviceManager() {
-    // Sync light states with device manager
-    for (var light in _lights) {
-      final level = _deviceManager.getLightLevel('Office Lights');
-      final brightness = _getLightBrightnessFromLevel(level);
-      final isOn = level != 'Off';
+    // Sync current light state from DeviceManager into _lightOn
+    final isOn = _deviceManager.getLightState('Office Lights');
+    setState(() {
+      _lightOn = isOn;
+    });
+  }
 
-      if (light.brightness != brightness || light.isOn != isOn) {
-        final index = _lights.indexWhere((l) => l.id == light.id);
-        if (index != -1) {
-          _lights[index] = light.copyWith(
-            brightness: brightness,
-            isOn: isOn,
-          );
-        }
-      }
-    }
+  Future<void> _restoreAutomationPreference() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getBool(_automationPrefKey) ?? false;
+    if (!mounted || !saved) return;
+    await _onAutomationSwitch(true);
+  }
 
-    // Sync AC states with device manager
-    final temp1 =
-        _deviceManager.getAirConditionerTemperature('Office AC Unit 1');
-    final temp2 =
-        _deviceManager.getAirConditionerTemperature('Office AC Unit 2');
-    final mode1 = _deviceManager.getAirConditionerMode('Office AC Unit 1');
-    final mode2 = _deviceManager.getAirConditionerMode('Office AC Unit 2');
-    final state1 = _deviceManager.getAirConditionerState('Office AC Unit 1');
-    final state2 = _deviceManager.getAirConditionerState('Office AC Unit 2');
-
-    if (_airConditioners[0].temperature != temp1.toInt() ||
-        _airConditioners[0].mode != mode1 ||
-        _airConditioners[0].isOn != state1) {
-      _airConditioners[0] = _airConditioners[0].copyWith(
-        temperature: temp1.toInt(),
-        mode: mode1,
-        isOn: state1,
-      );
-    }
-    if (_airConditioners[1].temperature != temp2.toInt() ||
-        _airConditioners[1].mode != mode2 ||
-        _airConditioners[1].isOn != state2) {
-      _airConditioners[1] = _airConditioners[1].copyWith(
-        temperature: temp2.toInt(),
-        mode: mode2,
-        isOn: state2,
-      );
-    }
+  Future<void> _persistAutomationEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_automationPrefKey, enabled);
   }
 
   int _getLightBrightnessFromLevel(String level) {
@@ -140,6 +96,330 @@ class _ControlScreenState extends State<ControlScreen> {
       default:
         return 70;
     }
+  }
+
+  Future<void> _onAutomationSwitch(bool value) async {
+    if (value == _automationOn) return;
+    if (!value) {
+      await _stopAutomation();
+      return;
+    }
+
+    setState(() {
+      _automationMessage = 'Starting automation...';
+      _automationBusy = true;
+    });
+
+    try {
+      await _ensureFirebaseReady();
+      await _loadInitialAutomationState();
+      await _startAutomationStream();
+      if (!mounted) return;
+      setState(() {
+        _automationOn = true;
+        _automationMessage = 'Automation active.';
+      });
+      await _persistAutomationEnabled(true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _automationOn = false;
+        _automationMessage = 'Automation error: $e';
+      });
+      await _persistAutomationEnabled(false);
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _automationBusy = false;
+      });
+    }
+  }
+
+  Future<void> _ensureFirebaseReady() async {
+    if (_firebaseReady) return;
+    if (Firebase.apps.isNotEmpty) {
+      _firebaseReady = true;
+      return;
+    }
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+    _firebaseReady = true;
+  }
+
+  Future<void> _loadInitialAutomationState() async {
+    final baseUrl = RealtimeDbService.defaultBaseUrl;
+    final sensorsRaw = await RealtimeDbService.get(
+      baseUrl: baseUrl,
+      path: '/sensors',
+    );
+    final controlsRaw = await RealtimeDbService.get(
+      baseUrl: baseUrl,
+      path: '/Control',
+    );
+
+    final sensors = _mapFromDynamic(sensorsRaw);
+    final controls = _mapFromDynamic(controlsRaw);
+
+    _currentTemp = _extractDouble(sensors,
+        const ['temperature_c', 'temp_c', 'temp', 'temperature', 'tem']);
+    _currentIaq =
+        _extractDouble(sensors, const ['iaq', 'IAQ', 'iaq_score', 'iaqIndex']);
+    _currentAcSetpoint = _extractDouble(
+        controls, const ['AC', 'ac', 'setpoint', 'target_temp', 'temperature']);
+    final afDouble = _extractDouble(
+        controls, const ['AF', 'af', 'air_flow', 'fan', 'fan_level']);
+    _currentAfLevel = afDouble?.round();
+  }
+
+  Future<void> _startAutomationStream() async {
+    await _automationSensorSub?.cancel();
+    _automationSensorSub = FirebaseDatabase.instance
+        .ref()
+        .onValue
+        .listen(_handleAutomationEvent, onError: (Object e) {
+      if (!mounted) return;
+      setState(() {
+        _automationMessage = 'Sensor stream error: $e';
+      });
+    });
+  }
+
+  Future<void> _stopAutomation() async {
+    await _automationSensorSub?.cancel();
+    _automationSensorSub = null;
+    if (mounted) {
+      setState(() {
+        _automationOn = false;
+        _automationBusy = false;
+        _automationMessage = 'Automation disabled.';
+        _tempHighSince = null;
+        _tempLowSince = null;
+        _tempHighMildApplied = false;
+        _tempHighSevereApplied = false;
+        _tempLowMildApplied = false;
+        _tempLowSevereApplied = false;
+      });
+    }
+    await _persistAutomationEnabled(false);
+  }
+
+  void _handleAutomationEvent(DatabaseEvent event) {
+    final root = _mapFromDynamic(event.snapshot.value);
+    if (root == null) return;
+
+    final sensors = _mapFromDynamic(root['sensors']);
+    final controls = _mapFromDynamic(root['Control'] ?? root['controls']);
+
+    final temp = _extractDouble(sensors,
+        const ['temperature_c', 'temp_c', 'temp', 'temperature', 'tem']);
+    final iaq =
+        _extractDouble(sensors, const ['iaq', 'IAQ', 'iaq_score', 'iaqIndex']);
+    final acSetpoint = _extractDouble(
+        controls, const ['AC', 'ac', 'setpoint', 'target_temp', 'temperature']);
+    final afLevel = _extractDouble(
+        controls, const ['AF', 'af', 'air_flow', 'fan', 'fan_level'])?.round();
+
+    setState(() {
+      _currentTemp = temp ?? _currentTemp;
+      _currentIaq = iaq ?? _currentIaq;
+      _currentAcSetpoint = acSetpoint ?? _currentAcSetpoint;
+      _currentAfLevel = afLevel ?? _currentAfLevel;
+    });
+
+    if (!_automationOn) return;
+    if (temp != null) {
+      _processTemperature(temp);
+    }
+    if (iaq != null) {
+      _processAirQuality(iaq);
+    }
+  }
+
+  void _processTemperature(double temp) {
+    final now = DateTime.now();
+    if (temp > _tempHighThreshold) {
+      _tempLowSince = null;
+      _tempLowMildApplied = false;
+      _tempLowSevereApplied = false;
+      _tempHighSince ??= now;
+      final elapsed = now.difference(_tempHighSince!);
+      if (elapsed >= _severeDuration) {
+        _applyTemperatureAdjustment(-2,
+            alreadyAppliedMild: _tempHighMildApplied,
+            severeFlagSetter: () => _tempHighSevereApplied = true,
+            mildFlagSetter: () => _tempHighMildApplied = true,
+            severeApplied: _tempHighSevereApplied);
+      } else if (elapsed >= _mildDuration && !_tempHighMildApplied) {
+        _queueTemperatureChange(-1);
+        _tempHighMildApplied = true;
+      }
+    } else if (temp < _tempLowThreshold) {
+      _tempHighSince = null;
+      _tempHighMildApplied = false;
+      _tempHighSevereApplied = false;
+      _tempLowSince ??= now;
+      final elapsed = now.difference(_tempLowSince!);
+      if (elapsed >= _severeDuration) {
+        _applyTemperatureAdjustment(2,
+            alreadyAppliedMild: _tempLowMildApplied,
+            severeFlagSetter: () => _tempLowSevereApplied = true,
+            mildFlagSetter: () => _tempLowMildApplied = true,
+            severeApplied: _tempLowSevereApplied);
+      } else if (elapsed >= _mildDuration && !_tempLowMildApplied) {
+        _queueTemperatureChange(1);
+        _tempLowMildApplied = true;
+      }
+    } else {
+      _tempHighSince = null;
+      _tempLowSince = null;
+      _tempHighMildApplied = false;
+      _tempHighSevereApplied = false;
+      _tempLowMildApplied = false;
+      _tempLowSevereApplied = false;
+    }
+  }
+
+  void _applyTemperatureAdjustment(
+    int totalDelta, {
+    required bool alreadyAppliedMild,
+    required VoidCallback severeFlagSetter,
+    required VoidCallback mildFlagSetter,
+    required bool severeApplied,
+  }) {
+    if (severeApplied) return;
+    final delta = alreadyAppliedMild ? (totalDelta > 0 ? 1 : -1) : totalDelta;
+    _queueTemperatureChange(delta);
+    mildFlagSetter();
+    severeFlagSetter();
+  }
+
+  Future<void> _queueTemperatureChange(int delta) async {
+    if (_automationBusy) return;
+    setState(() {
+      _automationBusy = true;
+      _automationMessage =
+          'Adjusting AC by ${delta > 0 ? '+' : ''}$delta °C...';
+    });
+
+    try {
+      final nextValue = await _computeNextSetpoint(delta);
+      if (nextValue == null) {
+        if (!mounted) return;
+        setState(() {
+          _automationBusy = false;
+          _automationMessage = 'Could not determine AC setpoint.';
+        });
+        return;
+      }
+      await _writeAcSetpoint(nextValue);
+      if (!mounted) return;
+      setState(() {
+        _automationBusy = false;
+        _currentAcSetpoint = nextValue;
+        _automationMessage =
+            'AC setpoint adjusted to ${nextValue.toStringAsFixed(1)} °C.';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _automationBusy = false;
+        _automationMessage = 'Failed to adjust AC: $e';
+      });
+    }
+  }
+
+  Future<double?> _computeNextSetpoint(int delta) async {
+    if (_currentAcSetpoint == null) {
+      final controlsRaw = await RealtimeDbService.get(
+        baseUrl: RealtimeDbService.defaultBaseUrl,
+        path: '/Control',
+      );
+      final controls = _mapFromDynamic(controlsRaw);
+      _currentAcSetpoint = _extractDouble(controls,
+          const ['AC', 'ac', 'setpoint', 'target_temp', 'temperature']);
+    }
+    final base = _currentAcSetpoint ?? _defaultAcSetpoint;
+    return base + delta;
+  }
+
+  Future<void> _writeAcSetpoint(double value) async {
+    await RealtimeDbService.patch(
+      baseUrl: RealtimeDbService.defaultBaseUrl,
+      path: '/Control',
+      data: {'AC': value},
+    );
+  }
+
+  void _processAirQuality(double iaq) {
+    int target = _baseAfLevel;
+    if (iaq >= 300) {
+      target = 100;
+    } else if (iaq >= 200) {
+      target = 85;
+    } else if (iaq >= 150) {
+      target = 70;
+    }
+
+    if (_currentAfLevel == target) return;
+    if (_automationBusy) return;
+    setState(() {
+      _automationBusy = true;
+      _automationMessage = 'Updating airflow to $target.';
+    });
+
+    RealtimeDbService.patch(
+      baseUrl: RealtimeDbService.defaultBaseUrl,
+      path: '/Control',
+      data: {'AF': target},
+    ).then((_) {
+      if (!mounted) return;
+      setState(() {
+        _automationBusy = false;
+        _currentAfLevel = target;
+        _automationMessage = 'Airflow level set to $target.';
+      });
+    }).catchError((e) {
+      if (!mounted) return;
+      setState(() {
+        _automationBusy = false;
+        _automationMessage = 'Failed to set airflow: $e';
+      });
+    });
+  }
+
+  Map<String, dynamic>? _mapFromDynamic(dynamic value) {
+    if (value is Map) {
+      return value.map((key, val) => MapEntry(key.toString(), val));
+    }
+    return null;
+  }
+
+  double? _extractDouble(
+      Map<String, dynamic>? map, List<String> candidateKeys) {
+    if (map == null) return null;
+    for (final key in candidateKeys) {
+      if (map.containsKey(key)) {
+        final v = map[key];
+        final parsed = _toDouble(v);
+        if (parsed != null) return parsed;
+      }
+      final match = map.entries.firstWhere(
+        (entry) => entry.key.toLowerCase() == key.toLowerCase(),
+        orElse: () => const MapEntry('', null),
+      );
+      if (match.key.isNotEmpty) {
+        final parsed = _toDouble(match.value);
+        if (parsed != null) return parsed;
+      }
+    }
+    return null;
+  }
+
+  double? _toDouble(dynamic value) {
+    if (value is num) return value.toDouble();
+    if (value is String) return double.tryParse(value);
+    return null;
   }
 
   String _getLevelFromBrightness(int brightness) {
@@ -166,9 +446,9 @@ class _ControlScreenState extends State<ControlScreen> {
             children: [
               _buildHeader(isWebDemo, isMobile),
               SizedBox(height: isWebDemo ? 32 : 24),
-              _buildLightsSection(isWebDemo, isMobile),
-              SizedBox(height: isWebDemo ? 32 : 24),
-              _buildAirConditionersSection(isWebDemo, isMobile),
+              _buildSingleLightSection(isWebDemo),
+              const SizedBox(height: 16),
+              _buildAutomationSection(isWebDemo),
               SizedBox(height: isWebDemo ? 32 : 80), // Extra space for mobile
             ],
           ),
@@ -238,745 +518,293 @@ class _ControlScreenState extends State<ControlScreen> {
     );
   }
 
-  Widget _buildLightsSection(bool isWebDemo, bool isMobile) {
+  Widget _buildSingleLightSection(bool isWebDemo) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(
           children: [
-            Icon(
-              Icons.lightbulb,
-              color: const Color(0xFF8B5CF6),
-              size: isWebDemo ? 28 : 24,
-            ),
+            Icon(Icons.lightbulb,
+                color: const Color(0xFF8B5CF6), size: isWebDemo ? 28 : 24),
             SizedBox(width: isWebDemo ? 12 : 8),
-            Text(
-              'Lights Control',
-              style: TextStyle(
-                fontSize: isWebDemo ? 24 : 20,
-                fontWeight: FontWeight.bold,
-                color: const Color(0xFF1F2937),
-              ),
-            ),
-          ],
-        ),
-        // small action buttons on the right (firebase test)
-        Row(
-          children: [
-            IconButton(
-              onPressed: () {
-                Navigator.of(context).push(MaterialPageRoute(
-                    builder: (_) => const _FirebaseTestLauncher()));
-              },
-              icon: const Icon(Icons.cloud_upload, color: Colors.white),
-              tooltip: 'Open Firebase Test',
-            ),
+            Text('Light Control',
+                style: TextStyle(
+                    fontSize: isWebDemo ? 24 : 20,
+                    fontWeight: FontWeight.bold,
+                    color: const Color(0xFF1F2937))),
           ],
         ),
         SizedBox(height: isWebDemo ? 16 : 12),
-
-        // Responsive grid for lights
-        if (isWebDemo)
-          GridView.builder(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: MediaQuery.of(context).size.width > 1200 ? 3 : 2,
-              crossAxisSpacing: 16,
-              mainAxisSpacing: 16,
-              childAspectRatio: 1.1,
+        Container(
+          padding: EdgeInsets.all(isWebDemo ? 20 : 12),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: _lightOn ? const Color(0xFF8B5CF6) : Colors.grey.shade300,
+              width: 2,
             ),
-            itemCount: _lights.length,
-            itemBuilder: (context, index) =>
-                _buildLightCard(_lights[index], isWebDemo, isMobile),
-          )
-        else
-          ListView.builder(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            itemCount: _lights.length,
-            itemBuilder: (context, index) => Padding(
-              padding: EdgeInsets.only(bottom: isWebDemo ? 16 : 12),
-              child: _buildLightCard(_lights[index], isWebDemo, isMobile),
-            ),
-          ),
-      ],
-    );
-  }
-
-  Widget _buildAirConditionersSection(bool isWebDemo, bool isMobile) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Icon(
-              Icons.ac_unit,
-              color: const Color(0xFF06B6D4),
-              size: isWebDemo ? 28 : 24,
-            ),
-            SizedBox(width: isWebDemo ? 12 : 8),
-            Text(
-              'Air Conditioners',
-              style: TextStyle(
-                fontSize: isWebDemo ? 24 : 20,
-                fontWeight: FontWeight.bold,
-                color: const Color(0xFF1F2937),
-              ),
-            ),
-          ],
-        ),
-        SizedBox(height: isWebDemo ? 16 : 12),
-
-        // Responsive grid for ACs
-        if (isWebDemo && _airConditioners.length > 1)
-          GridView.builder(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 2,
-              crossAxisSpacing: 16,
-              mainAxisSpacing: 16,
-              childAspectRatio: 1.1,
-            ),
-            itemCount: _airConditioners.length,
-            itemBuilder: (context, index) => _buildAirConditionerCard(
-                _airConditioners[index], isWebDemo, isMobile),
-          )
-        else
-          ListView.builder(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            itemCount: _airConditioners.length,
-            itemBuilder: (context, index) => Padding(
-              padding: EdgeInsets.only(bottom: isWebDemo ? 16 : 12),
-              child: _buildAirConditionerCard(
-                  _airConditioners[index], isWebDemo, isMobile),
-            ),
-          ),
-      ],
-    );
-  }
-
-  Widget _buildLightCard(LightDevice light, bool isWebDemo, bool isMobile) {
-    return Container(
-      padding: EdgeInsets.all(isWebDemo ? 20 : 12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: light.isOn ? const Color(0xFF8B5CF6) : Colors.grey.shade300,
-          width: 2,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.05),
-            blurRadius: 10,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          // Header with title and action buttons
-          Row(
-            children: [
-              Expanded(
-                flex: 3,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      light.name,
-                      style: TextStyle(
-                        fontSize: isWebDemo ? 18 : 16,
-                        fontWeight: FontWeight.bold,
-                        color: const Color(0xFF1F2937),
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    SizedBox(height: isWebDemo ? 4 : 2),
-                    Text(
-                      light.location,
-                      style: TextStyle(
-                        fontSize: isWebDemo ? 12 : 11,
-                        color: Colors.grey.shade600,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ],
-                ),
-              ),
-
-              // Edit and Delete buttons
-              Flexible(
-                flex: 1,
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    IconButton(
-                      onPressed: () => _editLight(light),
-                      icon: const Icon(Icons.edit),
-                      iconSize: isWebDemo ? 18 : 16,
-                      color: const Color(0xFF8B5CF6),
-                      tooltip: 'Edit Light',
-                      padding: EdgeInsets.all(isMobile ? 4 : 8),
-                      constraints: BoxConstraints(
-                        minWidth: isMobile ? 28 : 36,
-                        minHeight: isMobile ? 28 : 36,
-                      ),
-                    ),
-                    IconButton(
-                      onPressed: () => _deleteLight(light),
-                      icon: const Icon(Icons.delete),
-                      iconSize: isWebDemo ? 18 : 16,
-                      color: Colors.red.shade400,
-                      tooltip: 'Remove Light',
-                      padding: EdgeInsets.all(isMobile ? 4 : 8),
-                      constraints: BoxConstraints(
-                        minWidth: isMobile ? 28 : 36,
-                        minHeight: isMobile ? 28 : 36,
-                      ),
-                    ),
-                  ],
-                ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.05),
+                blurRadius: 10,
+                offset: const Offset(0, 4),
               ),
             ],
           ),
-
-          SizedBox(height: isWebDemo ? 16 : 12),
-
-          // On/Off Switch
-          Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Transform.scale(
-                scale: isWebDemo ? 1.0 : 0.8,
-                child: Switch(
-                  value: light.isOn,
-                  onChanged: (value) => _toggleLight(light, value),
-                  activeColor: const Color(0xFF8B5CF6),
-                ),
-              ),
-              SizedBox(width: isWebDemo ? 8 : 4),
-              Expanded(
-                child: Text(
-                  light.isOn ? 'On' : 'Off',
-                  style: TextStyle(
-                    fontSize: isWebDemo ? 14 : 12,
-                    fontWeight: FontWeight.w500,
-                    color: light.isOn
-                        ? const Color(0xFF10B981)
-                        : Colors.grey.shade600,
-                  ),
-                ),
-              ),
-            ],
-          ),
-
-          if (light.isOn) ...[
-            SizedBox(height: isWebDemo ? 16 : 12),
-
-            // Brightness control
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Brightness: ${light.brightness}%',
-                  style: TextStyle(
-                    fontSize: isWebDemo ? 12 : 11,
-                    fontWeight: FontWeight.w500,
-                    color: const Color(0xFF1F2937),
-                  ),
-                ),
-                SizedBox(height: isWebDemo ? 8 : 4),
-                SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    trackHeight: isWebDemo ? 6 : 4,
-                    thumbShape: RoundSliderThumbShape(
-                      enabledThumbRadius: isWebDemo ? 10 : 8,
-                    ),
-                  ),
-                  child: Slider(
-                    value: light.brightness.toDouble(),
-                    min: 0,
-                    max: 100,
-                    divisions: 20,
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(_lightOn ? 'On' : 'Off',
+                      style: TextStyle(
+                          fontSize: isWebDemo ? 18 : 16,
+                          fontWeight: FontWeight.w600)),
+                  Switch(
+                    value: _lightOn,
+                    onChanged: _sending ? null : (v) => _toggleLightAndSend(v),
                     activeColor: const Color(0xFF8B5CF6),
-                    onChanged: (value) =>
-                        _changeBrightness(light, value.round()),
                   ),
-                ),
-              ],
-            ),
-          ],
-        ],
-      ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              // Text(
+              //     'Latency: ${_latencyMicros != null ? '${_latencyMicros} μs' : '—'}'),
+            ],
+          ),
+        ),
+      ],
     );
   }
 
-  Widget _buildAirConditionerCard(
-      AirConditionerDevice ac, bool isWebDemo, bool isMobile) {
-    return Container(
-      padding: EdgeInsets.all(isWebDemo ? 20 : 12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: ac.isOn ? const Color(0xFF06B6D4) : Colors.grey.shade300,
-          width: 2,
+  Widget _buildAutomationSection(bool isWebDemo) {
+    final subtitleStyle = TextStyle(
+      fontSize: isWebDemo ? 14 : 13,
+      color: Colors.grey.shade600,
+    );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.auto_mode,
+                color: const Color(0xFF06B6D4), size: isWebDemo ? 28 : 24),
+            SizedBox(width: isWebDemo ? 12 : 8),
+            Text('Automation',
+                style: TextStyle(
+                    fontSize: isWebDemo ? 24 : 20,
+                    fontWeight: FontWeight.bold,
+                    color: const Color(0xFF1F2937))),
+          ],
         ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.05),
-            blurRadius: 10,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          // Header with title and action buttons
-          Row(
-            children: [
-              Expanded(
-                flex: 3,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      ac.name,
-                      style: TextStyle(
-                        fontSize: isWebDemo ? 18 : 16,
-                        fontWeight: FontWeight.bold,
-                        color: const Color(0xFF1F2937),
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    SizedBox(height: isWebDemo ? 4 : 2),
-                    Text(
-                      ac.location,
-                      style: TextStyle(
-                        fontSize: isWebDemo ? 12 : 11,
-                        color: Colors.grey.shade600,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ],
-                ),
-              ),
-
-              // Edit and Delete buttons
-              Flexible(
-                flex: 1,
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    IconButton(
-                      onPressed: () => _editAirConditioner(ac),
-                      icon: const Icon(Icons.edit),
-                      iconSize: isWebDemo ? 18 : 16,
-                      color: const Color(0xFF06B6D4),
-                      tooltip: 'Edit AC',
-                      padding: EdgeInsets.all(isMobile ? 4 : 8),
-                      constraints: BoxConstraints(
-                        minWidth: isMobile ? 28 : 36,
-                        minHeight: isMobile ? 28 : 36,
-                      ),
-                    ),
-                    IconButton(
-                      onPressed: () => _deleteAirConditioner(ac),
-                      icon: const Icon(Icons.delete),
-                      iconSize: isWebDemo ? 18 : 16,
-                      color: Colors.red.shade400,
-                      tooltip: 'Remove AC',
-                      padding: EdgeInsets.all(isMobile ? 4 : 8),
-                      constraints: BoxConstraints(
-                        minWidth: isMobile ? 28 : 36,
-                        minHeight: isMobile ? 28 : 36,
-                      ),
-                    ),
-                  ],
-                ),
+        SizedBox(height: isWebDemo ? 16 : 12),
+        Container(
+          padding: EdgeInsets.all(isWebDemo ? 20 : 12),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: _automationOn
+                  ? const Color(0xFF06B6D4)
+                  : Colors.grey.shade300,
+              width: 2,
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.05),
+                blurRadius: 10,
+                offset: const Offset(0, 4),
               ),
             ],
           ),
-
-          SizedBox(height: isWebDemo ? 16 : 12),
-
-          // On/Off Switch
-          Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Transform.scale(
-                scale: isWebDemo ? 1.0 : 0.8,
-                child: Switch(
-                  value: ac.isOn,
-                  onChanged: (value) => _toggleAirConditioner(ac, value),
-                  activeColor: const Color(0xFF06B6D4),
-                ),
-              ),
-              SizedBox(width: isWebDemo ? 8 : 4),
-              Expanded(
-                child: Text(
-                  ac.isOn ? 'On' : 'Off',
-                  style: TextStyle(
-                    fontSize: isWebDemo ? 14 : 12,
-                    fontWeight: FontWeight.w500,
-                    color: ac.isOn
-                        ? const Color(0xFF10B981)
-                        : Colors.grey.shade600,
-                  ),
-                ),
-              ),
-            ],
-          ),
-
-          if (ac.isOn) ...[
-            SizedBox(height: isWebDemo ? 16 : 12),
-
-            // Temperature control
-            Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Temperature',
-                        style: TextStyle(
-                          fontSize: isWebDemo ? 12 : 11,
-                          fontWeight: FontWeight.w500,
-                          color: const Color(0xFF1F2937),
-                        ),
-                      ),
-                      SizedBox(height: isWebDemo ? 4 : 2),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 8),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF06B6D4).withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Text(
-                          '${ac.temperature}°C',
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          _automationOn ? 'Automation On' : 'Automation Off',
                           style: TextStyle(
-                            fontSize: isWebDemo ? 16 : 14,
-                            fontWeight: FontWeight.bold,
-                            color: const Color(0xFF06B6D4),
+                            fontSize: isWebDemo ? 18 : 16,
+                            fontWeight: FontWeight.w600,
                           ),
                         ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Automatic AC and air-flow control based on sensor readings.',
+                          style: subtitleStyle,
+                        ),
+                      ],
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      if (_automationBusy)
+                        const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      Switch(
+                        value: _automationOn,
+                        onChanged: _automationBusy
+                            ? null
+                            : (v) => _onAutomationSwitch(v),
+                        activeColor: const Color(0xFF06B6D4),
                       ),
                     ],
                   ),
-                ),
-                SizedBox(width: isWebDemo ? 16 : 8),
-                Column(
+                ],
+              ),
+              if (_automationOn) ...[
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 8,
                   children: [
-                    IconButton(
-                      onPressed: () =>
-                          _changeTemperature(ac, ac.temperature + 1),
-                      icon: const Icon(Icons.add),
-                      iconSize: isWebDemo ? 20 : 16,
-                      color: const Color(0xFF06B6D4),
-                      constraints: BoxConstraints(
-                        minWidth: isMobile ? 32 : 40,
-                        minHeight: isMobile ? 32 : 40,
-                      ),
-                    ),
-                    IconButton(
-                      onPressed: () =>
-                          _changeTemperature(ac, ac.temperature - 1),
-                      icon: const Icon(Icons.remove),
-                      iconSize: isWebDemo ? 20 : 16,
-                      color: const Color(0xFF06B6D4),
-                      constraints: BoxConstraints(
-                        minWidth: isMobile ? 32 : 40,
-                        minHeight: isMobile ? 32 : 40,
-                      ),
+                    _automationChip(
+                        label: 'Temperature',
+                        value: _currentTemp != null
+                            ? '${_currentTemp!.toStringAsFixed(1)} °C'
+                            : '—'),
+                    _automationChip(
+                        label: 'IAQ',
+                        value: _currentIaq != null
+                            ? _currentIaq!.toStringAsFixed(0)
+                            : '—'),
+                    _automationChip(
+                        label: 'AC Setpoint',
+                        value: _currentAcSetpoint != null
+                            ? '${_currentAcSetpoint!.toStringAsFixed(1)} °C'
+                            : '—'),
+                    _automationChip(
+                      label: 'AF Level',
+                      value: _currentAfLevel != null
+                          ? _currentAfLevel.toString()
+                          : '—',
                     ),
                   ],
                 ),
               ],
-            ),
-
-            SizedBox(height: isWebDemo ? 12 : 8),
-
-            // Mode Selection
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
+              if (_automationMessage != null) ...[
+                const SizedBox(height: 12),
                 Text(
-                  'Mode',
+                  _automationMessage!,
                   style: TextStyle(
-                    fontSize: isWebDemo ? 12 : 11,
-                    fontWeight: FontWeight.w500,
-                    color: const Color(0xFF1F2937),
-                  ),
-                ),
-                SizedBox(height: isWebDemo ? 4 : 2),
-                Container(
-                  width: double.infinity,
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: Colors.grey.shade50,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.grey.shade300),
-                  ),
-                  child: DropdownButton<String>(
-                    value: ac.mode,
-                    isExpanded: true,
-                    underline: const SizedBox(),
-                    items: ['Heat', 'Cool', 'Eco', 'Dry'].map((mode) {
-                      return DropdownMenuItem(
-                        value: mode,
-                        child: Text(
-                          mode,
-                          style: TextStyle(
-                            fontSize: isWebDemo ? 13 : 12,
-                            color: const Color(0xFF1F2937),
-                          ),
-                        ),
-                      );
-                    }).toList(),
-                    onChanged: (value) {
-                      if (value != null) {
-                        _changeMode(ac, value);
-                      }
-                    },
+                    fontSize: 13,
+                    color: _automationOn
+                        ? const Color(0xFF047857)
+                        : Colors.grey.shade600,
                   ),
                 ),
               ],
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _automationChip({required String label, required String value}) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF3F4F6),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: const TextStyle(
+              fontSize: 12,
+              color: Color(0xFF6B7280),
+              fontWeight: FontWeight.w600,
             ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  // Light control methods
-  void _toggleLight(LightDevice light, bool isOn) {
-    setState(() {
-      final index = _lights.indexWhere((l) => l.id == light.id);
-      if (index != -1) {
-        _lights[index] = light.copyWith(isOn: isOn);
-
-        // Sync with device manager
-        _deviceManager.updateLightState('Office Lights', isOn);
-        if (isOn) {
-          final level = _getLevelFromBrightness(_lights[index].brightness);
-          _deviceManager.updateLightLevel('Office Lights', level);
-        } else {
-          _deviceManager.updateLightLevel('Office Lights', 'Off');
-        }
-        _syncWithDeviceManager();
-      }
-    });
-  }
-
-  void _changeBrightness(LightDevice light, int brightness) {
-    setState(() {
-      final index = _lights.indexWhere((l) => l.id == light.id);
-      if (index != -1) {
-        _lights[index] = light.copyWith(brightness: brightness);
-
-        // Sync with device manager
-        final level = _getLevelFromBrightness(brightness);
-        _deviceManager.updateLightLevel('Office Lights', level);
-      }
-    });
-  }
-
-  void _editLight(LightDevice light) {
-    // TODO: Implement edit light dialog
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Edit ${light.name}'),
-        backgroundColor: const Color(0xFF8B5CF6),
-      ),
-    );
-  }
-
-  void _deleteLight(LightDevice light) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('Remove Light'),
-        content: Text('Are you sure you want to remove "${light.name}"?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
           ),
-          ElevatedButton(
-            onPressed: () {
-              setState(() {
-                _lights.removeWhere((l) => l.id == light.id);
-              });
-              Navigator.pop(context);
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('Light removed successfully'),
-                  backgroundColor: Colors.red,
-                ),
-              );
-            },
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            child: const Text('Remove', style: TextStyle(color: Colors.white)),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            style: const TextStyle(
+              fontSize: 16,
+              color: Color(0xFF111827),
+              fontWeight: FontWeight.w700,
+            ),
           ),
         ],
       ),
     );
   }
 
-  // Air conditioner control methods
-  void _toggleAirConditioner(AirConditionerDevice ac, bool isOn) {
+  // Single light control: toggle and send to RTDB with latency measurement
+  Future<void> _toggleLightAndSend(bool isOn) async {
     setState(() {
-      final index = _airConditioners.indexWhere((a) => a.id == ac.id);
-      if (index != -1) {
-        _airConditioners[index] = ac.copyWith(isOn: isOn);
-
-        // Sync with device manager
-        _deviceManager.updateAirConditionerState(ac.name, isOn);
-        _syncWithDeviceManager();
-      }
+      _lightOn = isOn;
+      _sending = true;
     });
-  }
 
-  void _changeTemperature(AirConditionerDevice ac, int temperature) {
-    if (temperature >= 16 && temperature <= 30) {
+    try {
+      final baseUrl = RealtimeDbService.defaultBaseUrl;
+      final int start = DateTime.now().microsecondsSinceEpoch;
+      await RealtimeDbService.patch(
+        baseUrl: baseUrl,
+        path: '/Control',
+        data: {
+          'Light_status': _lightOn ? 'on' : 'off',
+          'Light_updated_at': DateTime.now().toIso8601String(),
+        },
+      );
+      final int end = DateTime.now().microsecondsSinceEpoch;
+      final int latency = end - start;
+
+      await RealtimeDbService.patch(
+        baseUrl: baseUrl,
+        path: '/',
+        data: {
+          'latency': latency, // kept for compatibility (microseconds)
+          'latency_us': latency,
+          'latency_ms': latency ~/ 1000,
+        },
+      );
+
       setState(() {
-        final index = _airConditioners.indexWhere((a) => a.id == ac.id);
-        if (index != -1) {
-          _airConditioners[index] = ac.copyWith(temperature: temperature);
+        _latencyMicros = latency;
+      });
 
-          // Sync with device manager
-          _deviceManager.updateAirConditionerTemperature(
-              ac.name, temperature.toDouble());
-        }
+      // sync simple state back to DeviceManager
+      _deviceManager.updateLightState('Office Lights', _lightOn);
+      if (!_lightOn) _deviceManager.updateLightLevel('Office Lights', 'Off');
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('RTDB error: $e'), backgroundColor: Colors.red),
+      );
+    } finally {
+      setState(() {
+        _sending = false;
       });
     }
   }
 
-  void _changeMode(AirConditionerDevice ac, String mode) {
-    setState(() {
-      final index = _airConditioners.indexWhere((a) => a.id == ac.id);
-      if (index != -1) {
-        _airConditioners[index] = ac.copyWith(mode: mode);
-
-        // Sync with device manager
-        _deviceManager.updateAirConditionerMode(ac.name, mode);
-        _syncWithDeviceManager();
-      }
-    });
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('${ac.name} mode changed to $mode'),
-        backgroundColor: const Color(0xFF06B6D4),
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      ),
-    );
-  }
-
-  void _editAirConditioner(AirConditionerDevice ac) {
-    // TODO: Implement edit AC dialog
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Edit ${ac.name}'),
-        backgroundColor: const Color(0xFF06B6D4),
-      ),
-    );
-  }
-
-  void _deleteAirConditioner(AirConditionerDevice ac) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('Remove Air Conditioner'),
-        content: Text('Are you sure you want to remove "${ac.name}"?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              setState(() {
-                _airConditioners.removeWhere((a) => a.id == ac.id);
-              });
-              Navigator.pop(context);
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('Air conditioner removed successfully'),
-                  backgroundColor: Colors.red,
-                ),
-              );
-            },
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            child: const Text('Remove', style: TextStyle(color: Colors.white)),
-          ),
-        ],
-      ),
-    );
-  }
+  // Removed AC control methods
 }
 
-// Small launcher to avoid importing the test screen everywhere
-class _FirebaseTestLauncher extends StatelessWidget {
-  const _FirebaseTestLauncher();
+const double _tempLowThreshold = 21.0;
+const double _tempHighThreshold = 26.0;
+const Duration _mildDuration = Duration(minutes: 1);
+const Duration _severeDuration = Duration(minutes: 3);
+const double _defaultAcSetpoint = 26.0;
+const int _baseAfLevel = 50;
 
-  @override
-  Widget build(BuildContext context) {
-    // Lazy import the test screen when pushed to avoid extra dependencies on main flow
-    return FutureBuilder(
-      future: Future.delayed(Duration.zero),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState != ConnectionState.done) {
-          return const Scaffold(
-              body: Center(child: CircularProgressIndicator()));
-        }
-        // Use MaterialPageRoute to push the actual test screen
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          Navigator.of(context).pushReplacement(
-              MaterialPageRoute(builder: (_) => const _FirebaseTestRedirect()));
-        });
-        return const SizedBox.shrink();
-      },
-    );
-  }
-}
-
-class _FirebaseTestRedirect extends StatelessWidget {
-  const _FirebaseTestRedirect();
-
-  @override
-  Widget build(BuildContext context) {
-    // Import here to avoid static import at top
-    return const _FirebaseTestHost();
-  }
-}
-
-// Host that actually constructs the test screen. Kept private to avoid polluting imports.
-class _FirebaseTestHost extends StatelessWidget {
-  const _FirebaseTestHost();
-
-  @override
-  Widget build(BuildContext context) {
-    // Directly return the screen defined in separate file
-    return const FirebaseTestScreen();
-  }
-}
+// Removed Firebase Test navigation helpers
 
 // Light device model
 class LightDevice {
@@ -1016,42 +844,4 @@ class LightDevice {
 }
 
 // Air conditioner device model
-class AirConditionerDevice {
-  final String id;
-  final String name;
-  final String location;
-  final bool isOn;
-  final int temperature;
-  final String mode;
-  final String fanSpeed;
-
-  AirConditionerDevice({
-    required this.id,
-    required this.name,
-    required this.location,
-    required this.isOn,
-    required this.temperature,
-    required this.mode,
-    required this.fanSpeed,
-  });
-
-  AirConditionerDevice copyWith({
-    String? id,
-    String? name,
-    String? location,
-    bool? isOn,
-    int? temperature,
-    String? mode,
-    String? fanSpeed,
-  }) {
-    return AirConditionerDevice(
-      id: id ?? this.id,
-      name: name ?? this.name,
-      location: location ?? this.location,
-      isOn: isOn ?? this.isOn,
-      temperature: temperature ?? this.temperature,
-      mode: mode ?? this.mode,
-      fanSpeed: fanSpeed ?? this.fanSpeed,
-    );
-  }
-}
+// Removed AirConditionerDevice model since AC UI is removed

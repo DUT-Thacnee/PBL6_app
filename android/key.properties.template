@@ -1,0 +1,6 @@
+# Copy these values into android/key.properties.local when configuring local signing.
+# This placeholder remains in version control for reference only.
+storePassword=change_me
+keyPassword=change_me
+keyAlias=upload
+storeFile=upload-keystore.jks

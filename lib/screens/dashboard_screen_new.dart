@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_database/firebase_database.dart';
 import 'dart:async';
 import '../firebase_options.dart';
+import 'login_screen.dart';
 import 'report_screen.dart';
 import 'scheduling_screen.dart';
 import 'control_screen.dart';
@@ -24,11 +26,18 @@ class _MainScreenState extends State<MainScreen> {
   final List<Map<String, dynamic>> _recentReadings = [];
   StreamSubscription<QuerySnapshot>? _readingsSub;
 
+  // Realtime monitoring sensors
+  StreamSubscription<DatabaseEvent>? _sensorSub;
+  DateTime? _sensorUpdatedAt;
+  double? _sensorTemp;
+  double? _sensorHumidity;
+  String? _sensorError;
+  bool _sensorLoading = true;
+
   // IAQ series for last month
   final List<_TimeValue> _iaqSeries = [];
   bool _loadingIaq = false;
-  // Aggregates/metrics
-  int _count30d = 0;
+  StreamSubscription<QuerySnapshot>? _iaqSub;
   DateTime? _lastUpdate;
 
   final List<String> _pageNames = const [
@@ -53,7 +62,8 @@ class _MainScreenState extends State<MainScreen> {
         _isInitialized = true;
       });
       _setupReadingsListener();
-      _loadIaqLastMonth();
+      _setupRealtimeMonitor();
+      _setupIaqListener();
     } catch (e) {
       setState(() {
         _initError = 'Firebase init error: $e';
@@ -61,33 +71,26 @@ class _MainScreenState extends State<MainScreen> {
     }
   }
 
-  Future<void> _loadIaqLastMonth() async {
-    if (_loadingIaq) return;
+  void _setupIaqListener() {
+    _iaqSub?.cancel();
     setState(() {
       _loadingIaq = true;
     });
 
-    try {
-      // Fetch up to 500 latest docs, then filter to last 30 days in-app
-      final snapshot = await FirebaseFirestore.instance
-          .collection('readings')
-          .orderBy('datetime', descending: true)
-          .limit(500)
-          .get();
+    final query = FirebaseFirestore.instance
+        .collection('readings')
+        .orderBy('datetime', descending: true)
+        .limit(500);
 
-      final now = DateTime.now();
-      final thirtyDaysAgo = now.subtract(const Duration(days: 30));
-
+    _iaqSub = query.snapshots().listen((snapshot) {
+      final thirtyDaysAgo = DateTime.now().subtract(const Duration(days: 30));
       final List<_TimeValue> points = [];
-      int count30 = 0;
+
       for (final doc in snapshot.docs) {
         final data = doc.data();
         final dt = _parseDateTime(data['datetime']);
         if (dt == null) continue;
-        if (dt.isBefore(thirtyDaysAgo))
-          break; // since we fetched in descending order
-        // Count all readings in last 30 days
-        count30++;
+        if (dt.isBefore(thirtyDaysAgo)) break;
 
         final iaqVal = _getValue(
           data,
@@ -95,28 +98,27 @@ class _MainScreenState extends State<MainScreen> {
           patterns: const ['iaq'],
         );
         final d = _toDoubleSafely(iaqVal);
-        if (d != null) {
+        if (d != null && d >= _kIaqMin && d <= _kIaqMax) {
           points.add(_TimeValue(dt, d));
         }
       }
 
-      points.sort((a, b) => a.t.compareTo(b.t)); // ascending for plotting
+      points.sort((a, b) => a.t.compareTo(b.t));
 
+      if (!mounted) return;
       setState(() {
+        _loadingIaq = false;
         _iaqSeries
           ..clear()
           ..addAll(points);
-        _count30d = count30;
       });
-    } catch (e) {
-      debugPrint('load IAQ series error: $e');
-    } finally {
-      if (mounted) {
-        setState(() {
-          _loadingIaq = false;
-        });
-      }
-    }
+    }, onError: (Object e) {
+      debugPrint('IAQ stream error: $e');
+      if (!mounted) return;
+      setState(() {
+        _loadingIaq = false;
+      });
+    });
   }
 
   DateTime? _parseDateTime(dynamic v) {
@@ -212,6 +214,104 @@ class _MainScreenState extends State<MainScreen> {
     });
   }
 
+  void _setupRealtimeMonitor() {
+    _sensorSub?.cancel();
+    setState(() {
+      _sensorLoading = true;
+      _sensorError = null;
+    });
+
+    try {
+      final ref = FirebaseDatabase.instance.ref('sensors');
+      _sensorSub = ref.onValue.listen((event) {
+        final sensorMap = _asStringKeyMap(event.snapshot.value);
+        if (sensorMap == null) {
+          if (!mounted) return;
+          setState(() {
+            _sensorLoading = false;
+            _sensorTemp = null;
+            _sensorHumidity = null;
+            _sensorError = 'Không tìm thấy dữ liệu cảm biến';
+            _sensorUpdatedAt = DateTime.now();
+          });
+          return;
+        }
+
+        final tempVal = _getValue(sensorMap, keys: const [
+          'temperature_c',
+          'temp_c',
+          'temp',
+          'temperature',
+          'tem'
+        ], patterns: const []);
+        final humVal = _getValue(sensorMap,
+            keys: const ['humidity', 'hum', 'humidity_percent'],
+            patterns: const ['hum']);
+        final tsVal = sensorMap['ts'] ??
+            sensorMap['timestamp'] ??
+            sensorMap['datetime'] ??
+            sensorMap['updatedAt'];
+        final updatedAt = _parseRealtimeTimestamp(tsVal) ?? DateTime.now();
+
+        final temp = _toDoubleSafely(tempVal);
+        final hum = _toDoubleSafely(humVal);
+
+        if (!mounted) return;
+        setState(() {
+          _sensorLoading = false;
+          _sensorTemp = temp;
+          _sensorHumidity = hum;
+          _sensorUpdatedAt = updatedAt;
+          _sensorError = (temp == null && hum == null)
+              ? 'Dữ liệu cảm biến không hợp lệ'
+              : null;
+        });
+      }, onError: (Object e) {
+        if (!mounted) return;
+        setState(() {
+          _sensorLoading = false;
+          _sensorError = 'Lỗi cảm biến: $e';
+        });
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _sensorLoading = false;
+        _sensorError = 'Không thể kết nối cảm biến: $e';
+      });
+    }
+  }
+
+  Map<String, dynamic>? _asStringKeyMap(dynamic value) {
+    if (value is Map) {
+      final result = <String, dynamic>{};
+      value.forEach((key, val) {
+        result[key.toString()] = val;
+      });
+      return result;
+    }
+    return null;
+  }
+
+  DateTime? _parseRealtimeTimestamp(dynamic v) {
+    if (v == null) return null;
+    if (v is int) {
+      final bool isMillis = v.abs() > 9999999999;
+      final int ms = isMillis ? v : v * 1000;
+      return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true).toLocal();
+    }
+    if (v is double) {
+      return _parseRealtimeTimestamp(v.round());
+    }
+    if (v is String) {
+      final parsed = _parseDateTime(v);
+      if (parsed != null) return parsed;
+      final numeric = double.tryParse(v);
+      if (numeric != null) return _parseRealtimeTimestamp(numeric);
+    }
+    return null;
+  }
+
   // Helpers to robustly read and format values from Firestore
   dynamic _getValue(Map<String, dynamic> data,
       {List<String> keys = const [], List<String> patterns = const []}) {
@@ -283,6 +383,8 @@ class _MainScreenState extends State<MainScreen> {
   @override
   void dispose() {
     _readingsSub?.cancel();
+    _sensorSub?.cancel();
+    _iaqSub?.cancel();
     super.dispose();
   }
 
@@ -442,11 +544,147 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
+  Widget _buildMonitoringPanel() {
+    final tempDisplay =
+        _sensorTemp != null ? '${_sensorTemp!.toStringAsFixed(1)} °C' : '—';
+    final humDisplay = _sensorHumidity != null
+        ? '${_sensorHumidity!.toStringAsFixed(1)} %'
+        : '—';
+    final updatedLabel = _sensorUpdatedAt != null
+        ? _formatDateTime(_sensorUpdatedAt!)
+        : (_sensorLoading ? 'Đang đồng bộ...' : 'Chưa có dữ liệu');
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: const [
+            Icon(Icons.monitor_heart, color: Color(0xFFEF4444)),
+            SizedBox(width: 8),
+            Text(
+              'Monitoring',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Card(
+          elevation: 3,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: _sensorLoading
+                ? const SizedBox(
+                    height: 72,
+                    child: Center(
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  )
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: _monitoringMetric(
+                              icon: Icons.thermostat,
+                              iconColor: const Color(0xFFEF4444),
+                              label: 'Temperature',
+                              value: tempDisplay,
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: _monitoringMetric(
+                              icon: Icons.water_drop,
+                              iconColor: const Color(0xFF06B6D4),
+                              label: 'Humidity',
+                              value: humDisplay,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      if (_sensorError != null)
+                        Text(
+                          _sensorError!,
+                          style: const TextStyle(
+                            color: Color(0xFFDC2626),
+                            fontSize: 12,
+                          ),
+                        )
+                      else
+                        Text(
+                          'Updated: $updatedLabel',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey[600],
+                          ),
+                        ),
+                    ],
+                  ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _monitoringMetric({
+    required IconData icon,
+    required Color iconColor,
+    required String label,
+    required String value,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF9FAFB),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFE5E7EB)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, size: 20, color: iconColor),
+              const SizedBox(width: 8),
+              Text(
+                label,
+                style: const TextStyle(
+                  fontSize: 14,
+                  color: Color(0xFF374151),
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            value,
+            style: const TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.w700,
+              color: Color(0xFF111827),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   // Recent table section extracted for reuse in responsive layout
   Widget _buildRecentTableCard() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        _buildMonitoringPanel(),
+        const SizedBox(height: 20),
         Row(
           children: const [
             Icon(Icons.sensors, color: Colors.blue),
@@ -556,15 +794,6 @@ class _MainScreenState extends State<MainScreen> {
             ),
             const SizedBox(height: 12),
             _metricTile(
-              icon: Icons.grid_view_rounded,
-              iconColor: const Color(0xFF3B82F6),
-              title: 'Total Records (30D)',
-              trailing: _statusChip(_count30d > 0 ? '$_count30d' : '—',
-                  background: const Color(0xFFEFF6FF),
-                  textColor: const Color(0xFF1D4ED8)),
-            ),
-            const SizedBox(height: 12),
-            _metricTile(
               icon: Icons.access_time_rounded,
               iconColor: const Color(0xFF10B981),
               title: 'Last Update',
@@ -576,7 +805,7 @@ class _MainScreenState extends State<MainScreen> {
             _metricTile(
               icon: Icons.insights_rounded,
               iconColor: const Color(0xFF8B5CF6),
-              title: 'Data Quality',
+              title: 'Air Quality',
               trailing: _statusChip(qualityTag.label,
                   background: qualityTag.color.withOpacity(0.15),
                   textColor: qualityTag.color),
@@ -872,22 +1101,19 @@ class _MainScreenState extends State<MainScreen> {
   }
 
   Future<void> _showLogoutDialog() async {
-    return showDialog(
+    final shouldLogout = await showDialog<bool>(
       context: context,
-      builder: (BuildContext context) {
+      builder: (BuildContext dialogContext) {
         return AlertDialog(
           title: const Text('Logout'),
           content: const Text('Are you sure you want to logout?'),
           actions: [
             TextButton(
-              onPressed: () => Navigator.pop(context),
+              onPressed: () => Navigator.pop(dialogContext, false),
               child: const Text('Cancel'),
             ),
             TextButton(
-              onPressed: () {
-                // TODO: Implement logout logic
-                Navigator.pop(context);
-              },
+              onPressed: () => Navigator.pop(dialogContext, true),
               child: const Text(
                 'Logout',
                 style: TextStyle(color: Colors.red),
@@ -897,8 +1123,18 @@ class _MainScreenState extends State<MainScreen> {
         );
       },
     );
+
+    if (shouldLogout == true && mounted) {
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+        (route) => false,
+      );
+    }
   }
 }
+
+const double _kIaqMin = 0;
+const double _kIaqMax = 100;
 
 class _TimeValue {
   final DateTime t;
@@ -935,15 +1171,8 @@ class _LineChartPainter extends CustomPainter {
     // Compute ranges
     final minX = points.first.t.millisecondsSinceEpoch.toDouble();
     final maxX = points.last.t.millisecondsSinceEpoch.toDouble();
-    double minY = points.first.v;
-    double maxY = points.first.v;
-    for (final p in points) {
-      if (p.v < minY) minY = p.v;
-      if (p.v > maxY) maxY = p.v;
-    }
-    final yPadding = (maxY - minY).abs() * 0.1 + 1;
-    minY -= yPadding;
-    maxY += yPadding;
+    const double minY = _kIaqMin;
+    const double maxY = _kIaqMax;
 
     // Scales
     double scaleX(double x) => maxX - minX == 0
@@ -1089,15 +1318,8 @@ class _YAxisPainter extends CustomPainter {
     );
 
     // Range
-    double minY = points.first.v;
-    double maxY = points.first.v;
-    for (final p in points) {
-      if (p.v < minY) minY = p.v;
-      if (p.v > maxY) maxY = p.v;
-    }
-    final yPadding = (maxY - minY).abs() * 0.1 + 1;
-    minY -= yPadding;
-    maxY += yPadding;
+    const double minY = _kIaqMin;
+    const double maxY = _kIaqMax;
 
     double scaleY(double y) => maxY - minY == 0
         ? chartRect.bottom
